@@ -1,1 +1,1 @@
-web: php -S 0.0.0.0:$PORT api.php
+web: php -S 0.0.0.0:${PORT:-8080} api.php
