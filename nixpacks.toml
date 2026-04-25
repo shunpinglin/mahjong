@@ -1,16 +1,2 @@
-[phases.setup]
-nixPkgs = [
-  "php",
-  "phpExtensions.pdo",
-  "phpExtensions.pdo_pgsql",
-  "phpExtensions.pgsql",
-  "phpExtensions.mbstring",
-  "phpExtensions.openssl",
-  "phpExtensions.curl"
-]
-
-[phases.build]
-cmds = ["php -r \"copy('https://getcomposer.org/installer', 'composer-setup.php');\" && php composer-setup.php && php composer.phar install --no-dev"]
-
 [start]
 cmd = "php -S 0.0.0.0:80 api.php"
