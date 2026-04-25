@@ -1,5 +1,13 @@
 <?php
-// ═══════════════════════════════════════════════════
+// 臨時診斷：列出所有已載入的擴充
+if(isset($_GET['ext'])){
+    echo json_encode([
+        'extensions' => get_loaded_extensions(),
+        'php_version' => PHP_VERSION,
+    ]);
+    exit;
+}
+// ═══════════════
 //  麻將益智配對 — 全球排行榜 API v2.0
 //  平台：Railway + PostgreSQL
 //  診斷：?action=ping
