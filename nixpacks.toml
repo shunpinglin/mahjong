@@ -1,5 +1,15 @@
 [phases.setup]
-nixPkgs = ["php82", "php82Extensions.pdo", "php82Extensions.pdo_pgsql", "php82Extensions.mbstring", "php82Extensions.json"]
+nixPkgs = [
+  "php82",
+  "php82Extensions.pdo",
+  "php82Extensions.pdo_pgsql",
+  "php82Extensions.pgsql",
+  "php82Extensions.mbstring",
+  "php82Extensions.openssl"
+]
+
+[phases.install]
+cmds = ["composer install --no-dev --optimize-autoloader"]
 
 [start]
-cmd = "php -S 0.0.0.0:$PORT"
+cmd = "php -S 0.0.0.0:$PORT api.php"
