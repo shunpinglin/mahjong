@@ -1,114 +1,168 @@
 <?php
 // ════════════════════════════════════════════════════════
-//  麻將益智配對 — 全球排行榜 API v3.0
-//  平台：Railway
-//  DB：Postgres（透過 pg_* 函數，若無則降回 /tmp SQLite）
+//  麻將益智配對 — 全球排行榜 API v6.0
+//  平台：Synology NAS
+//  儲存：SQLite3（NAS PHP內建支援，無寫入權限問題）
 //  診斷：?action=ping
 // ════════════════════════════════════════════════════════
+
+error_reporting(0);
+ini_set('display_errors', 0);
+ob_start();
 
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, X-Requested-With');
 header('Content-Type: application/json; charset=UTF-8');
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(204); exit; }
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    ob_end_clean(); http_response_code(204); exit;
+}
 
+// SQLite 資料庫放在 api.php 同目錄
+define('DB_FILE',      __DIR__ . '/mahjong.db');
 define('MAX_NAME_LEN', 12);
-define('MAX_RECORDS',  50);
 define('TOP_N',        10);
+define('MAX_PER_PLAYER', 50);
 
-// ════════════════════════════════════════════════════════
-//  DB 連線 — 優先 Postgres，降回 SQLite
-// ════════════════════════════════════════════════════════
-
-function usePostgres() {
-    return function_exists('pg_connect') && getenv('DATABASE_URL');
-}
-
-function getPgConn() {
-    static $conn = null;
-    if ($conn && pg_connection_status($conn) === PGSQL_CONNECTION_OK) return $conn;
-    $url   = getenv('DATABASE_URL');
-    $parts = parse_url($url);
-    $host  = $parts['host'];
-    $port  = $parts['port'] ?? 5432;
-    $db    = ltrim($parts['path'], '/');
-    $user  = $parts['user'];
-    $pass  = $parts['pass'];
-    $conn  = pg_connect("host=$host port=$port dbname=$db user=$user password=$pass sslmode=require");
-    if (!$conn) json_error(500, 'Postgres 連線失敗');
-    // 建立資料表
-    pg_query($conn, "
-        CREATE TABLE IF NOT EXISTS records (
-            id SERIAL PRIMARY KEY, name VARCHAR(20) NOT NULL,
-            level SMALLINT NOT NULL DEFAULT 1, score INTEGER NOT NULL DEFAULT 0,
-            time_sec INTEGER NOT NULL DEFAULT 0, stars SMALLINT NOT NULL DEFAULT 1,
-            streak SMALLINT NOT NULL DEFAULT 0, layout VARCHAR(20) DEFAULT 'rect',
-            ip_hash VARCHAR(64) DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        CREATE INDEX IF NOT EXISTS idx_score  ON records(score DESC);
-        CREATE INDEX IF NOT EXISTS idx_time   ON records(time_sec ASC);
-        CREATE INDEX IF NOT EXISTS idx_streak ON records(streak DESC);
-        CREATE INDEX IF NOT EXISTS idx_name   ON records(name);
-        CREATE TABLE IF NOT EXISTS rate_limit (
-            ip_hash VARCHAR(64), hit_time TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        CREATE INDEX IF NOT EXISTS idx_rate ON rate_limit(ip_hash, hit_time);
-    ");
-    return $conn;
-}
-
-function getSqliteDB() {
+// ── 資料庫連線與初始化 ──
+function getDB() {
     static $db = null;
     if ($db) return $db;
-    $db = new SQLite3('/tmp/mahjong.db');
-    $db->exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=3000;');
-    $db->exec('CREATE TABLE IF NOT EXISTS records (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
-        level INTEGER NOT NULL DEFAULT 1, score INTEGER NOT NULL DEFAULT 0,
-        time_sec INTEGER NOT NULL DEFAULT 0, stars INTEGER NOT NULL DEFAULT 1,
-        streak INTEGER NOT NULL DEFAULT 0, layout TEXT DEFAULT "rect",
-        ip_hash TEXT DEFAULT "", created_at INTEGER NOT NULL DEFAULT (strftime("%s","now"))
-    );
-    CREATE INDEX IF NOT EXISTS idx_score ON records(score DESC);
-    CREATE INDEX IF NOT EXISTS idx_name  ON records(name);
-    CREATE TABLE IF NOT EXISTS rate_limit (ip_hash TEXT, hit_time INTEGER);');
+
+    $db = new SQLite3(DB_FILE);
+    $db->exec('PRAGMA journal_mode=WAL;');
+    $db->exec('PRAGMA busy_timeout=5000;');
+    $db->exec('
+        CREATE TABLE IF NOT EXISTS records (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            name     TEXT    NOT NULL,
+            level    INTEGER NOT NULL DEFAULT 1,
+            score    INTEGER NOT NULL DEFAULT 0,
+            time_sec INTEGER NOT NULL DEFAULT 0,
+            stars    INTEGER NOT NULL DEFAULT 1,
+            streak   INTEGER NOT NULL DEFAULT 0,
+            layout   TEXT    NOT NULL DEFAULT "rect",
+            created_at INTEGER NOT NULL DEFAULT (strftime("%s","now"))
+        );
+        CREATE INDEX IF NOT EXISTS idx_name  ON records(name);
+        CREATE INDEX IF NOT EXISTS idx_score ON records(score DESC);
+    ');
     return $db;
 }
 
-// ════════════════════════════════════════════════════════
-//  速率限制
-// ════════════════════════════════════════════════════════
-function checkRateLimit($ip) {
-    $key = md5($ip);
-    $now = time();
-    try {
-        if (usePostgres()) {
-            $db = getPgConn();
-            pg_query($db, "DELETE FROM rate_limit WHERE hit_time < NOW() - INTERVAL '1 hour'");
-            $res = pg_query_params($db,
-                "SELECT COUNT(*) FROM rate_limit WHERE ip_hash=$1 AND hit_time > NOW() - INTERVAL '1 minute'",
-                [$key]);
-            if ((int)pg_fetch_result($res,0,0) >= 10) return false;
-            pg_query_params($db, "INSERT INTO rate_limit(ip_hash) VALUES($1)", [$key]);
-        } else {
-            $db = getSqliteDB();
-            $db->exec("DELETE FROM rate_limit WHERE hit_time < " . ($now - 3600));
-            $c = $db->querySingle("SELECT COUNT(*) FROM rate_limit WHERE ip_hash='$key' AND hit_time>" . ($now-60));
-            if ((int)$c >= 10) return false;
-            $db->exec("INSERT INTO rate_limit(ip_hash,hit_time) VALUES('$key',$now)");
-        }
-    } catch(Exception $e) { return true; }
-    return true;
-}
-
-// ════════════════════════════════════════════════════════
-//  工具函數
-// ════════════════════════════════════════════════════════
+// ── 工具函數 ──
 function sanitizeName($n) { return mb_substr(trim(strip_tags($n??'')), 0, MAX_NAME_LEN); }
 function validateInt($v,$min,$max) { $i=intval($v??0); return ($i>=$min&&$i<=$max)?$i:null; }
-function json_ok($d) { echo json_encode(['ok'=>true,'data'=>$d],JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT); exit; }
-function json_error($c,$m) { http_response_code($c); echo json_encode(['ok'=>false,'error'=>$m],JSON_UNESCAPED_UNICODE); exit; }
+function json_ok($d)    { ob_end_clean(); echo json_encode(['ok'=>true,'data'=>$d], JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT); exit; }
+function json_error($c,$m) { ob_end_clean(); http_response_code($c); echo json_encode(['ok'=>false,'error'=>$m], JSON_UNESCAPED_UNICODE); exit; }
+
+// ── 排行榜計算 ──
+function calcTotalBoard($db, $limit=TOP_N) {
+    $res = $db->query("
+        SELECT name,
+               SUM(score)   AS total,
+               COUNT(*)     AS levels,
+               MAX(score)   AS best,
+               MAX(streak)  AS streak,
+               MIN(CASE WHEN stars>=1 AND time_sec>0 THEN time_sec END) AS bestTime
+        FROM records
+        GROUP BY name
+        ORDER BY total DESC
+        LIMIT $limit
+    ");
+    $rows = [];
+    while ($r = $res->fetchArray(SQLITE3_ASSOC)) {
+        $rows[] = [
+            'name'     => $r['name'],
+            'score'    => (int)$r['total'],
+            'levels'   => (int)$r['levels'],
+            'best'     => (int)$r['best'],
+            'streak'   => (int)$r['streak'],
+            'bestTime' => $r['bestTime'] ? (int)$r['bestTime'] : null,
+        ];
+    }
+    return $rows;
+}
+
+function calcFastestBoard($db, $limit=TOP_N) {
+    $res = $db->query("
+        SELECT name, MIN(time_sec) AS bt, level, stars, score
+        FROM records WHERE stars>=1
+        GROUP BY name ORDER BY bt ASC LIMIT $limit
+    ");
+    $rows = [];
+    while ($r = $res->fetchArray(SQLITE3_ASSOC)) {
+        $rows[] = [
+            'name'  => $r['name'],
+            'time'  => (int)$r['bt'],
+            'level' => (int)$r['level'],
+            'stars' => (int)$r['stars'],
+            'score' => (int)$r['score'],
+        ];
+    }
+    return $rows;
+}
+
+function calcStreakBoard($db, $limit=TOP_N) {
+    $res = $db->query("
+        SELECT name, MAX(streak) AS bs, SUM(score) AS ts
+        FROM records GROUP BY name ORDER BY bs DESC LIMIT $limit
+    ");
+    $rows = [];
+    while ($r = $res->fetchArray(SQLITE3_ASSOC)) {
+        $rows[] = [
+            'name'   => $r['name'],
+            'streak' => (int)$r['bs'],
+            'score'  => (int)$r['ts'],
+        ];
+    }
+    return $rows;
+}
+
+// ── 初始化 NPC 資料（首次建立資料庫時） ──
+function initNPC($db) {
+    $count = (int)$db->querySingle("SELECT COUNT(*) FROM records");
+    if ($count > 0) return; // 已有資料，不重複初始化
+
+    $npcs = [
+        ['🏆 麻將老師傅', 9850, 42, 680, 187, 8, 3],
+        ['🌟 阿嬤快手',   8200, 36, 620, 215, 6, 3],
+        ['🎯 龜策大師',   7100, 31, 590, 243, 5, 3],
+        ['🐢 穩健達人',   5900, 26, 520, 278, 4, 3],
+        ['🌸 花式玩家',   4800, 22, 460, 312, 4, 2],
+        ['⚡ 閃電手',     3900, 18, 400, 156, 3, 3],
+        ['🍀 幸運星',     3100, 14, 350, 389, 3, 2],
+        ['🎋 竹籬大叔',   2400, 11, 310, 445, 2, 2],
+        ['🌙 夜貓玩家',   1700,  8, 260, 512, 2, 2],
+        ['🌱 新手上路',   1000,  5, 200, 598, 1, 1],
+    ];
+
+    $db->exec('BEGIN');
+    foreach ($npcs as [$name, $target, $levels, $best, $bestTime, $maxStreak, $stars]) {
+        // 第一筆：最佳記錄
+        $db->exec("INSERT INTO records(name,level,score,time_sec,stars,streak,layout)
+            VALUES('$name',12,$best,$bestTime,$stars,$maxStreak,'rect')");
+        $remaining = $target - $best;
+
+        // 其餘幾筆填滿總分
+        $perLevel = $levels > 1 ? intval($remaining / ($levels - 1)) : 0;
+        for ($i = 1; $i < $levels - 1; $i++) {
+            $s = max(50, $perLevel);
+            $t = $bestTime + $i * 30;
+            $sk = max(1, $maxStreak - $i);
+            $db->exec("INSERT INTO records(name,level,score,time_sec,stars,streak,layout)
+                VALUES('$name',max(1,12-$i),$s,$t,1,$sk,'rect')");
+            $remaining -= $s;
+        }
+        // 最後一筆補齊
+        if ($remaining > 0) {
+            $db->exec("INSERT INTO records(name,level,score,time_sec,stars,streak,layout)
+                VALUES('$name',1,$remaining,999,1,1,'rect')");
+        }
+    }
+    $db->exec('COMMIT');
+}
 
 // ════════════════════════════════════════════════════════
 //  路由
@@ -117,42 +171,41 @@ $action = $_GET['action'] ?? $_POST['action'] ?? '';
 
 switch ($action) {
 
-// ── 診斷 ──────────────────────────────────────────────
+// ── ping ──
 case 'ping':
-    $pg = usePostgres();
-    $db_ok = false;
-    $db_msg = '';
+    $dbOk = false; $dbErr = '';
     try {
-        if ($pg) {
-            $conn = getPgConn();
-            pg_query($conn, 'SELECT 1');
-            $db_ok  = true;
-            $db_msg = '✓ PostgreSQL (永久儲存)';
-        } else {
-            getSqliteDB();
-            $db_ok  = true;
-            $db_msg = '⚠ SQLite /tmp (重啟後清空，排行榜無法跨裝置共享)';
-        }
-    } catch(Exception $e) { $db_msg = '✗ '.$e->getMessage(); }
+        $db = getDB();
+        initNPC($db);
+        $db->exec("CREATE TABLE IF NOT EXISTS _test(x INTEGER)");
+        $db->exec("INSERT INTO _test VALUES(1)");
+        $db->exec("DELETE FROM _test");
+        $dbOk = true;
+    } catch (Exception $e) { $dbErr = $e->getMessage(); }
+
+    $total   = $dbOk ? (int)$db->querySingle("SELECT COUNT(*) FROM records") : 0;
+    $players = $dbOk ? (int)$db->querySingle("SELECT COUNT(DISTINCT name) FROM records") : 0;
 
     json_ok([
-        'status'    => 'ok',
-        'php'       => PHP_VERSION,
-        'pg_func'   => function_exists('pg_connect'),
-        'pdo_pgsql' => extension_loaded('pdo_pgsql'),
-        'sqlite3'   => class_exists('SQLite3'),
-        'db_type'   => $pg ? 'postgres' : 'sqlite',
-        'db_ok'     => $db_ok,
-        'db_msg'    => $db_msg,
-        'message'   => $db_ok ? '✓ 環境正常' : '✗ DB連線失敗',
+        'status'   => 'ok',
+        'php'      => PHP_VERSION,
+        'db_type'  => 'sqlite3',
+        'db_file'  => DB_FILE,
+        'db_ok'    => $dbOk,
+        'db_error' => $dbErr,
+        'records'  => $total,
+        'players'  => $players,
+        'db_msg'   => $dbOk
+            ? "✓ SQLite3 · {$players} 位玩家 · {$total} 筆記錄（含NPC）"
+            : "✗ SQLite3 失敗：$dbErr",
+        'message'  => $dbOk ? '✓ 環境正常！全球排行榜就緒' : '⚠ 資料庫失敗',
+        'sqlite3_ext' => class_exists('SQLite3'),
     ]);
     break;
 
-// ── 提交記錄 ──────────────────────────────────────────
+// ── submit ──
 case 'submit':
     if ($_SERVER['REQUEST_METHOD'] !== 'POST') json_error(405,'請使用POST');
-    $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
-    if (!checkRateLimit($ip)) json_error(429,'提交過於頻繁');
 
     $b      = json_decode(file_get_contents('php://input'),true) ?: $_POST;
     $name   = sanitizeName($b['name']   ?? '');
@@ -161,128 +214,92 @@ case 'submit':
     $time   = validateInt($b['time']    ?? 0, 1, 7200);
     $stars  = validateInt($b['stars']   ?? 1, 1, 3);
     $streak = validateInt($b['streak']  ?? 0, 0, 999);
-    $layout = in_array($b['layout']??'',['rect','pyramid','turtle','dragon','flower'])?$b['layout']:'rect';
+    $layout = in_array($b['layout']??'',['rect','pyramid','turtle','dragon','flower'])
+              ? $b['layout'] : 'rect';
 
     if (!$name||!$level||!$score||!$time) json_error(400,'缺少必要欄位');
-    if ($score > $level*500+3000) json_error(400,'分數異常');
 
-    $iph = md5($ip);
+    $db = getDB();
+    initNPC($db);
+    $esc = SQLite3::escapeString($name);
 
-    if (usePostgres()) {
-        $db = getPgConn();
-        // 清理超量記錄
-        $res = pg_query_params($db,"SELECT COUNT(*) FROM records WHERE name=$1",[$name]);
-        if ((int)pg_fetch_result($res,0,0) >= MAX_RECORDS) {
-            pg_query_params($db,
-                "DELETE FROM records WHERE name=$1 AND id=(SELECT id FROM records WHERE name=$1 ORDER BY score ASC LIMIT 1)",
-                [$name,$name]);
+    // 清理超量記錄（保留最高分）
+    $cnt = (int)$db->querySingle("SELECT COUNT(*) FROM records WHERE name='$esc'");
+    if ($cnt >= MAX_PER_PLAYER) {
+        $db->exec("DELETE FROM records WHERE name='$esc' AND id=(
+            SELECT id FROM records WHERE name='$esc' ORDER BY score ASC LIMIT 1)");
+    }
+
+    // 插入新記錄
+    $st = $db->prepare('INSERT INTO records(name,level,score,time_sec,stars,streak,layout)
+        VALUES(:n,:l,:s,:t,:st,:sr,:ly)');
+    $st->bindValue(':n', $name, SQLITE3_TEXT);
+    $st->bindValue(':l', $level, SQLITE3_INTEGER);
+    $st->bindValue(':s', $score, SQLITE3_INTEGER);
+    $st->bindValue(':t', $time,  SQLITE3_INTEGER);
+    $st->bindValue(':st',$stars, SQLITE3_INTEGER);
+    $st->bindValue(':sr',$streak,SQLITE3_INTEGER);
+    $st->bindValue(':ly',$layout,SQLITE3_TEXT);
+    $st->execute();
+
+    // 計算累積排名
+    $board = calcTotalBoard($db, 999);
+    $rank  = count($board) + 1;
+    $myTotal = 0;
+    foreach ($board as $i => $entry) {
+        if ($entry['name'] === $name) {
+            $rank    = $i + 1;
+            $myTotal = $entry['score'];
+            break;
         }
-        $res = pg_query_params($db,
-            "INSERT INTO records(name,level,score,time_sec,stars,streak,layout,ip_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",
-            [$name,$level,$score,$time,$stars,$streak,$layout,$iph]);
-        $newId = (int)pg_fetch_result($res,0,0);
-        $res2  = pg_query_params($db,"SELECT SUM(score) FROM records WHERE name=$1",[$name]);
-        $tot   = (int)pg_fetch_result($res2,0,0);
-        $res3  = pg_query($db,"SELECT COUNT(DISTINCT name)+1 FROM (SELECT name,SUM(score) t FROM records GROUP BY name HAVING SUM(score)>$tot) x");
-        $rank  = (int)pg_fetch_result($res3,0,0);
-    } else {
-        $db  = getSqliteDB();
-        $esc = $db->escapeString($name);
-        if ((int)$db->querySingle("SELECT COUNT(*) FROM records WHERE name='$esc'") >= MAX_RECORDS)
-            $db->exec("DELETE FROM records WHERE name='$esc' AND id=(SELECT id FROM records WHERE name='$esc' ORDER BY score ASC LIMIT 1)");
-        $st = $db->prepare('INSERT INTO records(name,level,score,time_sec,stars,streak,layout,ip_hash) VALUES(:n,:l,:s,:t,:st,:sr,:ly,:ip)');
-        $st->bindValue(':n',$name,SQLITE3_TEXT); $st->bindValue(':l',$level,SQLITE3_INTEGER);
-        $st->bindValue(':s',$score,SQLITE3_INTEGER); $st->bindValue(':t',$time,SQLITE3_INTEGER);
-        $st->bindValue(':st',$stars,SQLITE3_INTEGER); $st->bindValue(':sr',$streak,SQLITE3_INTEGER);
-        $st->bindValue(':ly',$layout,SQLITE3_TEXT); $st->bindValue(':ip',$iph,SQLITE3_TEXT);
-        $st->execute();
-        $newId = (int)$db->lastInsertRowID();
-        $tot   = (int)$db->querySingle("SELECT SUM(score) FROM records WHERE name='$esc'");
-        $rank  = (int)$db->querySingle("SELECT COUNT(DISTINCT name)+1 FROM(SELECT name,SUM(score) t FROM records GROUP BY name HAVING t>$tot)");
     }
-    json_ok(['id'=>$newId,'rank'=>$rank]);
+
+    json_ok(['rank'=>$rank, 'totalScore'=>$myTotal,
+             'totalPlayers'=>(int)$db->querySingle("SELECT COUNT(DISTINCT name) FROM records")]);
     break;
 
-// ── 排行榜 ────────────────────────────────────────────
+// ── board ──
 case 'board':
-    $tab  = $_GET['tab'] ?? 'total';
-    $rows = [];
+    $tab = $_GET['tab'] ?? 'total';
+    $db  = getDB();
+    initNPC($db);
 
-    if (usePostgres()) {
-        $db = getPgConn();
-        if ($tab==='total') {
-            $res = pg_query($db,"SELECT name,SUM(score) ts,COUNT(*) lc,MAX(score) bs,MIN(CASE WHEN stars>=1 THEN time_sec END) bt,MAX(streak) bst FROM records GROUP BY name ORDER BY ts DESC LIMIT ".TOP_N);
-            while ($r=pg_fetch_assoc($res)) $rows[]=['name'=>$r['name'],'score'=>(int)$r['ts'],'levels'=>(int)$r['lc'],'best'=>(int)$r['bs'],'bestTime'=>$r['bt']?(int)$r['bt']:null,'streak'=>(int)$r['bst']];
-        } elseif ($tab==='fastest') {
-            $res = pg_query($db,"SELECT name,MIN(time_sec) bt,level,stars,score FROM records WHERE stars>=1 GROUP BY name,level,stars,score ORDER BY bt ASC LIMIT ".TOP_N);
-            while ($r=pg_fetch_assoc($res)) $rows[]=['name'=>$r['name'],'time'=>(int)$r['bt'],'level'=>(int)$r['level'],'stars'=>(int)$r['stars'],'score'=>(int)$r['score']];
-        } elseif ($tab==='streak') {
-            $res = pg_query($db,"SELECT name,MAX(streak) bs,SUM(score) ts FROM records GROUP BY name ORDER BY bs DESC LIMIT ".TOP_N);
-            while ($r=pg_fetch_assoc($res)) $rows[]=['name'=>$r['name'],'streak'=>(int)$r['bs'],'score'=>(int)$r['ts']];
-        } else json_error(400,'無效榜單');
-        $tp = (int)pg_fetch_result(pg_query($db,"SELECT COUNT(DISTINCT name) FROM records"),0,0);
-        $tg = (int)pg_fetch_result(pg_query($db,"SELECT COUNT(*) FROM records"),0,0);
-    } else {
-        $db = getSqliteDB();
-        if ($tab==='total') {
-            $res=$db->query("SELECT name,SUM(score) ts,COUNT(*) lc,MAX(score) bs,MIN(CASE WHEN stars>=1 THEN time_sec ELSE NULL END) bt,MAX(streak) bst FROM records GROUP BY name ORDER BY ts DESC LIMIT ".TOP_N);
-            while($r=$res->fetchArray(SQLITE3_ASSOC)) $rows[]=['name'=>$r['name'],'score'=>(int)$r['ts'],'levels'=>(int)$r['lc'],'best'=>(int)$r['bs'],'bestTime'=>$r['bt']?(int)$r['bt']:null,'streak'=>(int)$r['bst']];
-        } elseif ($tab==='fastest') {
-            $res=$db->query("SELECT name,MIN(time_sec) bt,level,stars,score FROM records WHERE stars>=1 GROUP BY name ORDER BY bt ASC LIMIT ".TOP_N);
-            while($r=$res->fetchArray(SQLITE3_ASSOC)) $rows[]=['name'=>$r['name'],'time'=>(int)$r['bt'],'level'=>(int)$r['level'],'stars'=>(int)$r['stars'],'score'=>(int)$r['score']];
-        } elseif ($tab==='streak') {
-            $res=$db->query("SELECT name,MAX(streak) bs,SUM(score) ts FROM records GROUP BY name ORDER BY bs DESC LIMIT ".TOP_N);
-            while($r=$res->fetchArray(SQLITE3_ASSOC)) $rows[]=['name'=>$r['name'],'streak'=>(int)$r['bs'],'score'=>(int)$r['ts']];
-        } else json_error(400,'無效榜單');
-        $tp=(int)$db->querySingle("SELECT COUNT(DISTINCT name) FROM records");
-        $tg=(int)$db->querySingle("SELECT COUNT(*) FROM records");
-    }
+    if ($tab === 'total')        $top10 = calcTotalBoard($db);
+    elseif ($tab === 'fastest')  $top10 = calcFastestBoard($db);
+    elseif ($tab === 'streak')   $top10 = calcStreakBoard($db);
+    else json_error(400,'無效榜單');
 
-    json_ok(['tab'=>$tab,'top10'=>$rows,'totalPlayers'=>$tp,'totalGames'=>$tg,'updatedAt'=>date('Y-m-d H:i:s')]);
+    $tp = (int)$db->querySingle("SELECT COUNT(DISTINCT name) FROM records");
+    $tg = (int)$db->querySingle("SELECT COUNT(*) FROM records");
+    json_ok(['tab'=>$tab,'top10'=>$top10,'totalPlayers'=>$tp,'totalGames'=>$tg,'updatedAt'=>date('Y-m-d H:i:s')]);
     break;
 
-// ── 個人查詢 ──────────────────────────────────────────
+// ── my ──
 case 'my':
     $name = sanitizeName($_GET['name']??'');
-    if (!$name) json_error(400,'請提供玩家名稱');
-
-    if (usePostgres()) {
-        $db  = getPgConn();
-        $res = pg_query_params($db,"SELECT SUM(score) FROM records WHERE name=$1",[$name]);
-        $tot = (int)pg_fetch_result($res,0,0);
-        $rank= null;
-        if ($tot) {
-            $res2 = pg_query($db,"SELECT COUNT(DISTINCT name)+1 FROM(SELECT name,SUM(score) t FROM records GROUP BY name HAVING SUM(score)>$tot) x");
-            $rank = (int)pg_fetch_result($res2,0,0);
-        }
-        $res3 = pg_query_params($db,"SELECT MIN(time_sec) FROM records WHERE name=$1 AND stars>=1",[$name]);
-        $bt   = pg_fetch_result($res3,0,0);
-    } else {
-        $db  = getSqliteDB();
-        $esc = $db->escapeString($name);
-        $tot = (int)$db->querySingle("SELECT SUM(score) FROM records WHERE name='$esc'");
-        $rank= $tot?(int)$db->querySingle("SELECT COUNT(DISTINCT name)+1 FROM(SELECT name,SUM(score) t FROM records GROUP BY name HAVING t>$tot)"):null;
-        $bt  = $tot?$db->querySingle("SELECT MIN(time_sec) FROM records WHERE name='$esc' AND stars>=1"):null;
+    if (!$name) json_error(400,'請提供名稱');
+    $db = getDB();
+    $board = calcTotalBoard($db, 999);
+    $rank=null; $tot=0;
+    foreach ($board as $i=>$e) {
+        if ($e['name']===$name) { $rank=$i+1; $tot=$e['score']; break; }
     }
+    $esc = SQLite3::escapeString($name);
+    $bt  = $db->querySingle("SELECT MIN(time_sec) FROM records WHERE name='$esc' AND stars>=1");
     json_ok(['name'=>$name,'totalScore'=>(int)$tot,'totalRank'=>$rank,'bestTime'=>$bt?(int)$bt:null]);
     break;
 
-// ── 統計 ──────────────────────────────────────────────
+// ── stats ──
 case 'stats':
-    if (usePostgres()) {
-        $db = getPgConn();
-        $tp = (int)pg_fetch_result(pg_query($db,"SELECT COUNT(DISTINCT name) FROM records"),0,0);
-        $tg = (int)pg_fetch_result(pg_query($db,"SELECT COUNT(*) FROM records"),0,0);
-        $ts = (int)pg_fetch_result(pg_query($db,"SELECT COALESCE(SUM(score),0) FROM records"),0,0);
-    } else {
-        $db = getSqliteDB();
-        $tp = (int)$db->querySingle("SELECT COUNT(DISTINCT name) FROM records");
-        $tg = (int)$db->querySingle("SELECT COUNT(*) FROM records");
-        $ts = (int)$db->querySingle("SELECT COALESCE(SUM(score),0) FROM records");
-    }
-    json_ok(['totalPlayers'=>$tp,'totalGames'=>$tg,'totalScore'=>$ts]);
+    $db = getDB();
+    initNPC($db);
+    json_ok([
+        'totalPlayers' => (int)$db->querySingle("SELECT COUNT(DISTINCT name) FROM records"),
+        'totalGames'   => (int)$db->querySingle("SELECT COUNT(*) FROM records"),
+        'totalScore'   => (int)$db->querySingle("SELECT COALESCE(SUM(score),0) FROM records"),
+    ]);
     break;
 
 default:
-    json_ok(['service'=>'麻將排行榜 API','version'=>'3.0','tip'=>'?action=ping 診斷']);
+    json_ok(['service'=>'麻將排行榜 API','version'=>'6.0-SQLite','tip'=>'?action=ping']);
 }
